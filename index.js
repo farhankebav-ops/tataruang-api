@@ -26,10 +26,14 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 
-// Buat folder untuk menyimpan foto profil jika belum ada
+// Buat folder untuk menyimpan foto profil jika belum ada (Bungkus try-catch agar aman dari Read-Only Vercel)
 const profileDir = path.join(__dirname, 'uploads', 'profiles');
-if (!fs.existsSync(profileDir)) {
-  fs.mkdirSync(profileDir, { recursive: true });
+try {
+  if (!fs.existsSync(profileDir)) {
+    fs.mkdirSync(profileDir, { recursive: true });
+  }
+} catch (err) {
+  console.log("Folder profile gagal dibuat / read-only environment, aman di-bypass.");
 }
 
 // Konfigurasi Multer khusus untuk foto profil (simpan di disk, bukan memory)
@@ -45,12 +49,16 @@ const profileStorage = multer.diskStorage({
 const uploadProfile = multer({ storage: profileStorage });
 
 
-// Konfigurasi Database
+// --- PERBAIKAN SAKTI: LAZY LOADING DATABASE ---
+// Kita bungkus database ke dalam pool global, tapi handshake baru dilakukan pas endpoint SQL dipanggil aja.
 const db = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASS,
   database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 5, // Batasi koneksi biar gak nge-hang di serverless
+  queueLimit: 0
 });
 
 // --- MIDDLEWARE AUTENTIKASI ---
@@ -114,14 +122,13 @@ app.post('/api/scan', upload.single('image'), async (req, res) => {
     const base64Image = req.file.buffer.toString('base64');
     const mimeType = req.file.mimetype;
     
-    // Perbaikan: tanpa backslash
     const dataURI = `data:${mimeType};base64,${base64Image}`;
 
     // Konfigurasi payload untuk Fireworks API
     const payload = {
       model: "accounts/fireworks/models/kimi-k2p6",
       max_tokens: 2000,
-      temperature: 0.2, // Dibuat rendah agar JSON lebih konsisten
+      temperature: 0.2, 
       messages: [
         {
           role: "system",
@@ -145,14 +152,14 @@ app.post('/api/scan', upload.single('image'), async (req, res) => {
       ]
     };
 
-    // Tembak API Fireworks
+    // Tembak API Fireworks dengan Header Connection close biar ga gampang ECONNRESET
     const response = await fetch("https://api.fireworks.ai/inference/v1/chat/completions", {
       method: "POST",
       headers: {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        // Perbaikan: tanpa backslash
-        "Authorization": `Bearer ${process.env.FIREWORKS_API_KEY}`
+        "Authorization": `Bearer ${process.env.FIREWORKS_API_KEY}`,
+        "Connection": "close"
       },
       body: JSON.stringify(payload)
     });
@@ -163,45 +170,35 @@ app.post('/api/scan', upload.single('image'), async (req, res) => {
       throw new Error(data.error?.message || 'Gagal menghubungi Fireworks API');
     }
     
-    // Ambil teks balasan dari AI
     let aiMessage = data.choices[0].message.content;
     
-    // --- STRATEGI SUPER BARU: Bracket Counting ---
     let jsonString = null;
     let startIndex = aiMessage.indexOf('{');
     
     if (startIndex !== -1) {
       let depth = 0;
-      // Loop tiap karakter untuk mencari pasangan kurung tutup yang pas
       for (let i = startIndex; i < aiMessage.length; i++) {
         if (aiMessage[i] === '{') depth++;
         else if (aiMessage[i] === '}') depth--;
         
-        // Jika depth kembali 0, berarti 1 blok JSON utuh sudah ditemukan
         if (depth === 0) {
           jsonString = aiMessage.substring(startIndex, i + 1);
-          break; // Hentikan pencarian, abaikan teks AI sisanya
+          break; 
         }
       }
     }
 
     if (jsonString) {
-      // --- PEMBERSIH JSON OTOMATIS (MAGIC REGEX) ---
-      // 1. Hapus enter/tab yang sering diselipkan AI
       jsonString = jsonString.replace(/[\n\r\t]/g, ' ');
-      // 2. Hapus koma berlebih (trailing comma)
       jsonString = jsonString.replace(/,\s*([}\]])/g, '$1');
       
-      // Parse hasil yang sudah dibersihkan
       const parsedData = JSON.parse(jsonString);
 
-      // Kirim balasan ke frontend
       res.json({
         success: true,
         data: parsedData
       });
     } else {
-      // Jika sama sekali tidak ada kurung kurawal
       throw new Error("AI tidak mengembalikan struktur data yang benar. Coba scan ulang.");
     }
 
@@ -216,7 +213,6 @@ app.post('/api/scan', upload.single('image'), async (req, res) => {
 });
 
 // --- ENDPOINT RIWAYAT CHAT ---
-// Ambil semua sesi milik user
 app.get('/api/chat/sessions', authenticateToken, async (req, res) => {
   try {
     const [sessions] = await db.execute(
@@ -225,11 +221,10 @@ app.get('/api/chat/sessions', authenticateToken, async (req, res) => {
     );
     res.json({ success: true, sessions });
   } catch (error) {
-    res.status(500).json({ error: 'Gagal mengambil sesi chat.' });
+    res.status(500).json({ error: 'Gagal mengambil sesi chat atau database sibuk.' });
   }
 });
 
-// Ambil pesan dari sesi tertentu
 app.get('/api/chat/sessions/:id', authenticateToken, async (req, res) => {
   try {
     const [messages] = await db.execute(
@@ -237,7 +232,6 @@ app.get('/api/chat/sessions/:id', authenticateToken, async (req, res) => {
       [req.params.id]
     );
     
-    // Format waktu ke WIB (Waktu Indonesia Barat)
     const formattedMessages = messages.map(msg => ({
       role: msg.role,
       content: msg.content,
@@ -250,7 +244,7 @@ app.get('/api/chat/sessions/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Endpoint POST untuk Smart AI Chat (Dengan Session & AI Title Generator)
+// Endpoint POST untuk Smart AI Chat
 app.post('/api/chat', authenticateToken, async (req, res) => {
   try {
     const { message, sessionId } = req.body;
@@ -259,19 +253,16 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
 
     let currentSessionId = sessionId;
     let chatHistory = [];
-    let isNewSession = false; // Penanda apakah ini sesi baru
+    let isNewSession = false; 
 
-    // Jika tidak ada sesi, buat sesi baru
     if (!currentSessionId) {
       isNewSession = true;
-      // Buat judul sementara dulu agar kita dapat ID sesi
       const [newSession] = await db.execute(
         'INSERT INTO chat_sessions (user_id, title) VALUES (?, ?)',
         [req.user.id, 'Sesi Konsultasi Baru'] 
       );
       currentSessionId = newSession.insertId;
     } else {
-      // Ambil riwayat pesan sebelumnya untuk konteks AI
       const [history] = await db.execute(
         'SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC',
         [currentSessionId]
@@ -279,16 +270,14 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
       chatHistory = history.map(h => ({ role: h.role, content: h.content }));
     }
 
-    // 1. Simpan pesan user ke DB
     await db.execute(
       'INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)',
       [currentSessionId, 'user', message]
     );
 
-    // 2. Siapkan payload untuk Fireworks AI (Chat Utama)
     const chatSystemPrompt = {
       role: "system",
-      content: "Kamu adalah Smart AI Chat, asisten arsitek lini pertama..." // (Sesuaikan dengan prompt aslimu)
+      content: "Kamu adalah Smart AI Chat, asisten arsitek lini pertama..." 
     };
 
     const payloadMessages = [chatSystemPrompt, ...chatHistory, { role: 'user', content: message }];
@@ -305,7 +294,8 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
       headers: {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.FIREWORKS_API_KEY}`
+        "Authorization": `Bearer ${process.env.FIREWORKS_API_KEY}`,
+        "Connection": "close"
       },
       body: JSON.stringify(payload)
     });
@@ -315,27 +305,20 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
 
     const aiContent = data.choices[0].message.content;
 
-    // 3. Simpan balasan AI ke DB
     await db.execute(
       'INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)',
       [currentSessionId, 'assistant', aiContent]
     );
 
-    // =====================================================================
-    // 4. GENERATOR JUDUL OTOMATIS (CEREBRAS Llama 3.1 8B)
-    // =====================================================================
     if (isNewSession) {
-      // Step A: Buat judul fallback langsung dari 5 kata pertama chat user (Anti-Gagal)
       let fallbackTitle = message.split(' ').slice(0, 5).join(' ');
       if (fallbackTitle.length > 30) {
         fallbackTitle = fallbackTitle.substring(0, 30) + '...';
       }
 
-      // Langsung amankan database pakai judul fallback ini dulu
       await db.execute('UPDATE chat_sessions SET title = ? WHERE id = ?', [fallbackTitle, currentSessionId]);
 
       try {
-        // Step B: Eksekusi AI Cerebras untuk judul yang lebih estetik
         const completion = await cerebrasClient.chat.completions.create({
           messages: [
             {
@@ -356,21 +339,14 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
         
         if (aiText && aiText.trim().length > 0) {
           let generatedTitle = aiText.trim();
-          
-          // Bersihkan karakter aneh kalau AI ngeyel
           generatedTitle = generatedTitle.replace(/^"|"$/g, '').replace(/^'|'$/g, '').replace(/\.$/, '');
-
-          // Tumpuk (update) judul fallback tadi dengan hasil dari Cerebras
           await db.execute('UPDATE chat_sessions SET title = ? WHERE id = ?', [generatedTitle, currentSessionId]);
         }
       } catch (titleError) {
-        // Kalau Cerebras gangguan, diam-diam catat errornya dan biarkan judul fallback tetap terpakai
         console.error("Cerebras gagal, tetep pakai judul fallback:", titleError);
       }
     }
-    // =====================================================================
     
-    // 5. Kembalikan response ke Frontend
     res.json({
       success: true,
       sessionId: currentSessionId,
@@ -382,13 +358,11 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
 
   } catch (error) {
     console.error("Error saat chat AI:", error);
-    res.status(500).json({ success: false, error: 'Terjadi kesalahan sistem.' });
+    res.status(500).json({ success: false, error: 'Terjadi kesalahan sistem atau database sibuk.' });
   }
 });
 
 // --- ENDPOINT AUTENTIKASI ---
-
-// 1. Register Manual
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { nama, username, email, password, lokasi } = req.body;
@@ -406,11 +380,10 @@ app.post('/api/auth/register', async (req, res) => {
     res.status(201).json({ success: true, message: 'Registrasi berhasil.' });
   } catch (error) {
     console.error("Error Register:", error);
-    res.status(500).json({ error: 'Terjadi kesalahan pada server.' });
+    res.status(500).json({ error: 'Terjadi kesalahan pada server database.' });
   }
 });
 
-// 2. Login Manual
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -430,31 +403,20 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// 3. Google Login
-// 3. Google Login (OFFLINE DECODE HACK - BYPASS VPS TERBLOKIR)
 app.post('/api/auth/google', async (req, res) => {
   try {
     const { idToken } = req.body;
-
-    // BONGKAR TOKEN SECARA OFFLINE (Tanpa perlu koneksi internet keluar)
-    // Kita langsung baca payload yang ada di dalam idToken bawaan Google
     const payload = jwt.decode(idToken);
 
-    // Jika token kosong atau tidak bisa dibaca
     if (!payload || !payload.email) {
-      console.error("Token Google kosong atau rusak.");
       return res.status(401).json({ error: 'Token Google tidak valid.' });
     }
 
-    // Ambil email dan nama langsung dari hasil bongkaran token
     const { email, name } = payload; 
-
-    // Mulai dari sini, alurnya normal masuk ke Database lu
     const [users] = await db.execute('SELECT * FROM users WHERE email = ?', [email]);
     let user;
 
     if (users.length === 0) {
-      // Jika belum ada, buat akun baru
       const randomPassword = crypto.randomBytes(16).toString('hex');
       const hashedPassword = await bcrypt.hash(randomPassword, 10);
 
@@ -469,9 +431,7 @@ app.post('/api/auth/google', async (req, res) => {
       user = users[0];
     }
 
-    // Generate JWT Token lokal Tataruang
     const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' });
-
     res.json({ success: true, token, user: { id: user.id, nama: user.nama, email: user.email } });
   } catch (error) {
     console.error("Error Google Auth Offline:", error);
@@ -479,162 +439,103 @@ app.post('/api/auth/google', async (req, res) => {
   }
 });
 
-// 3. Logout
 app.post('/api/auth/logout', authenticateToken, async (req, res) => {
-  try {
-    // Pada arsitektur JWT stateless, token tidak disimpan di DB.
-    // Endpoint ini berfungsi sebagai validasi request dari client.
-    // Kedepannya, kamu bisa menambahkan logika token blacklist di sini jika diperlukan.
-    
-    res.json({ 
-      success: true, 
-      message: 'Logout berhasil. Sesi telah diakhiri.' 
-    });
-  } catch (error) {
-    console.error("Error Logout:", error);
-    res.status(500).json({ error: 'Terjadi kesalahan saat memproses logout.' });
-  }
+  res.json({ success: true, message: 'Logout berhasil.' });
 });
 
-
-// --- ENDPOINT CEK SESI (AUTH ME) ---
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
-    // Ambil data user terbaru dari database berdasarkan ID di token
-    const [users] = await db.execute(
-  'SELECT id, nama, email, lokasi, foto_profil FROM users WHERE id = ?', 
-  [req.user.id]
-);
-
-    if (users.length === 0) {
-      return res.status(404).json({ error: 'User tidak ditemukan.' });
-    }
-
+    const [users] = await db.execute('SELECT id, nama, email, lokasi, foto_profil FROM users WHERE id = ?', [req.user.id]);
+    if (users.length === 0) return res.status(404).json({ error: 'User tidak ditemukan.' });
     res.json({ success: true, user: users[0] });
   } catch (error) {
-    console.error("Error Auth Me:", error);
     res.status(500).json({ error: 'Terjadi kesalahan pada server.' });
   }
 });
 
-// Endpoint PUT untuk Ganti Kata Sandi
 app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
   try {
     const { sandiLama, sandiBaru } = req.body;
-    
-    if (!sandiLama || !sandiBaru) {
-      return res.status(400).json({ error: 'Sandi lama dan sandi baru wajib diisi.' });
-    }
+    if (!sandiLama || !sandiBaru) return res.status(400).json({ error: 'Kolom wajib diisi.' });
 
-    // Ambil data user dari DB
     const [users] = await db.execute('SELECT password FROM users WHERE id = ?', [req.user.id]);
     if (users.length === 0) return res.status(404).json({ error: 'User tidak ditemukan.' });
 
-    // Cek kecocokan sandi lama
     const match = await bcrypt.compare(sandiLama, users[0].password);
     if (!match) return res.status(401).json({ error: 'Sandi saat ini salah.' });
 
-    // Hash sandi baru dan update ke DB
     const hashedNewPassword = await bcrypt.hash(sandiBaru, 10);
     await db.execute('UPDATE users SET password = ? WHERE id = ?', [hashedNewPassword, req.user.id]);
 
-    res.json({ success: true, message: 'Kata sandi berhasil diperbarui.' });
+    res.json({ success: true, message: 'Kata sandi diperbarui.' });
   } catch (error) {
-    console.error("Error Ganti Sandi:", error);
     res.status(500).json({ error: 'Terjadi kesalahan pada server.' });
   }
 });
 
-// Endpoint PUT untuk Update Profil (Nama & Lokasi)
 app.put('/api/auth/profile', authenticateToken, async (req, res) => {
   try {
     const { nama, lokasi } = req.body;
-    
-    // Validasi sederhana
-    if (!nama) {
-      return res.status(400).json({ error: 'Nama tidak boleh kosong.' });
-    }
+    if (!nama) return res.status(400).json({ error: 'Nama wajib diisi.' });
 
-    // Update data di database
-    await db.execute(
-      'UPDATE users SET nama = ?, lokasi = ? WHERE id = ?',
-      [nama, lokasi || null, req.user.id]
-    );
-
-    res.json({ success: true, message: 'Profil berhasil diperbarui.' });
+    await db.execute('UPDATE users SET nama = ?, lokasi = ? WHERE id = ?', [nama, lokasi || null, req.user.id]);
+    res.json({ success: true, message: 'Profil diperbarui.' });
   } catch (error) {
-    console.error("Error Update Profile:", error);
-    res.status(500).json({ error: 'Terjadi kesalahan pada server saat menyimpan profil.' });
+    res.status(500).json({ error: 'Gagal memperbarui profil.' });
   }
 });
 
-// Endpoint POST untuk Upload Foto Profil
 app.post('/api/auth/profile/photo', authenticateToken, uploadProfile.single('photo'), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'Tidak ada gambar yang diunggah.' });
-
+    if (!req.file) return res.status(400).json({ error: 'Tidak ada gambar.' });
     const photoUrl = `/uploads/profiles/${req.file.filename}`;
 
-    // Ambil foto lama untuk dihapus dari server (opsional, agar storage tidak penuh)
     const [users] = await db.execute('SELECT foto_profil FROM users WHERE id = ?', [req.user.id]);
     const oldPhoto = users[0].foto_profil;
     if (oldPhoto) {
       const oldPath = path.join(__dirname, oldPhoto);
-      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+      try { if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath); } catch(e){}
     }
 
-    // Update database
     await db.execute('UPDATE users SET foto_profil = ? WHERE id = ?', [photoUrl, req.user.id]);
-
-    res.json({ success: true, message: 'Foto profil berhasil diperbarui.', photoUrl });
+    res.json({ success: true, photoUrl });
   } catch (error) {
-    console.error("Error Upload Photo:", error);
-    res.status(500).json({ error: 'Gagal mengunggah foto profil.' });
+    res.status(500).json({ error: 'Gagal mengunggah foto.' });
   }
 });
 
-// Endpoint DELETE untuk Hapus Foto Profil
 app.delete('/api/auth/profile/photo', authenticateToken, async (req, res) => {
   try {
     const [users] = await db.execute('SELECT foto_profil FROM users WHERE id = ?', [req.user.id]);
     const oldPhoto = users[0].foto_profil;
-    
     if (oldPhoto) {
       const oldPath = path.join(__dirname, oldPhoto);
-      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+      try { if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath); } catch(e){}
     }
-
     await db.execute('UPDATE users SET foto_profil = NULL WHERE id = ?', [req.user.id]);
-
-    res.json({ success: true, message: 'Foto profil berhasil dihapus.' });
+    res.json({ success: true });
   } catch (error) {
-    console.error("Error Delete Photo:", error);
-    res.status(500).json({ error: 'Gagal menghapus foto profil.' });
+    res.status(500).json({ error: 'Gagal menghapus foto.' });
   }
 });
 
-// --- ENDPOINT EXPERT / KONSULTAN ---
 app.get('/api/experts', async (req, res) => {
   try {
     const [experts] = await db.execute('SELECT id, nama, bio, nomor_wa, foto_profil FROM experts ORDER BY created_at DESC');
     res.json({ success: true, data: experts });
   } catch (error) {
-    console.error("Error Fetching Experts:", error);
-    res.status(500).json({ error: 'Gagal mengambil data konsultan.' });
+    res.status(500).json({ error: 'Gagal mengambil data.' });
   }
 });
 
-// --- ENDPOINT PENDAFTARAN RELAWAN (BRIDGE KE BOT WA) ---
+// --- ENDPOINT PENDAFTARAN RELAWAN (BRIDGE KE BOT WA VIA IP VPS NAT) ---
 app.post('/api/relawan/register', async (req, res) => {
   try {
     const { nama, whatsapp, instansi, keahlian, motivasi } = req.body;
-
-    // Validasi dasar
     if (!nama || !whatsapp || !instansi || !keahlian || !motivasi) {
       return res.status(400).json({ error: 'Semua kolom wajib diisi.' });
     }
 
-    // Format pesan untuk dikirim ke WA Admin
     const waMessage = `*🚨 PENDAFTARAN RELAWAN BARU TATARUANG.IN 🚨*\n\n` +
       `*Nama Lengkap:* ${nama}\n` +
       `*No WhatsApp:* ${whatsapp}\n` +
@@ -643,10 +544,11 @@ app.post('/api/relawan/register', async (req, res) => {
       `*Motivasi:*\n_${motivasi}_\n\n` +
       `Mohon segera ditindaklanjuti.`;
 
-    // Tembak ke Localhost API Bot WA (Baileys) di port 5000
-    const waResponse = await fetch('http://localhost:5000/send-message', {
+    // SAKTI: Tembak langsung ke Port NAT publik bot WA lo, bukan localhost!
+    // Ganti 5000 dengan PORT FORWARD NAT publik bot WA lo di VPS jika berbeda.
+    const waResponse = await fetch('http://202.155.143.190:5000/send-message', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Connection': 'close' },
       body: JSON.stringify({
         target: '6281929787463',
         message: waMessage
@@ -654,20 +556,14 @@ app.post('/api/relawan/register', async (req, res) => {
     });
 
     const waData = await waResponse.json();
+    if (!waResponse.ok || !waData.success) throw new Error('Gagal ke Bot WA');
 
-    if (!waResponse.ok || !waData.success) {
-      throw new Error('Gagal meneruskan pesan ke Bot WA');
-    }
-
-    res.json({ success: true, message: 'Data pendaftaran berhasil dikirim ke Admin.' });
+    res.json({ success: true, message: 'Data terkirim ke Admin.' });
   } catch (error) {
     console.error("Error Register Relawan:", error);
-    res.status(500).json({ error: 'Terjadi kesalahan sistem saat mengirim data.' });
+    res.status(500).json({ error: 'Gagal meneruskan data ke Bot WhatsApp Admin.' });
   }
 });
 
-// Jalankan Server
-app.listen(port, () => {
-  // Perbaikan: tanpa backslash
-  console.log(`Server berjalan di http://localhost:${port}`);
-});
+// --- SAKTI: EXPORT UNTUK VERCEL SERVERLESS ENVIRONMENT ---
+module.exports = app;
